@@ -1,7 +1,9 @@
+
 // ============================================================
 // DeepFake AI - Frontend Application
-// Same Website API Architecture
+// Corrected Complete Version
 // ============================================================
+
 
 // ------------------------------------------------------------
 // DOM SELECTORS
@@ -26,25 +28,10 @@ let registerMode = false;
 // ------------------------------------------------------------
 // API CONFIGURATION
 // ------------------------------------------------------------
-//
-// IMPORTANT:
-//
-// Production / FastAPI:
-//     https://your-domain.com/api/...
-//
-// Local FastAPI:
-//     http://127.0.0.1:8765/api/...
-//
-// Same website:
-//     /api/...
-//
-// If index.html is opened directly with file://,
-// automatically use local FastAPI.
-// ------------------------------------------------------------
 
 const API_BASE =
     window.location.protocol === "file:"
-        ? "http://127.0.0.1:8765"
+        ? "http://127.0.0.1:8000"
         : "";
 
 
@@ -60,8 +47,6 @@ async function api(path, options = {}) {
         ...(options.headers || {})
     };
 
-    // Don't manually set Content-Type for FormData.
-    // Browser will automatically create multipart boundary.
     if (token) {
         headers["Authorization"] = `Bearer ${token}`;
     }
@@ -82,7 +67,7 @@ async function api(path, options = {}) {
         throw new Error(
             "Backend se connection nahi ho raha.\n\n" +
             "Please make sure DeepFake server is running:\n" +
-            "http://127.0.0.1:8765"
+            "http://127.0.0.1:8000"
         );
     }
 }
@@ -115,6 +100,49 @@ async function readResponse(response) {
 
 
 // ------------------------------------------------------------
+// CONFIDENCE FORMATTER
+// Supports:
+// 0.633  -> 63.30%
+// 63.3   -> 63.30%
+// 6330   -> 63.30%
+// 63.30  -> 63.30%
+// ------------------------------------------------------------
+
+function formatConfidence(value) {
+
+    const confidence = Number(value);
+
+    if (!Number.isFinite(confidence)) {
+        return "0.00%";
+    }
+
+    let percentage;
+
+    if (confidence >= 0 && confidence <= 1) {
+
+        percentage = confidence * 100;
+
+    } else if (confidence > 100 && confidence <= 10000) {
+
+        // Handles values such as 6330 -> 63.30
+        percentage = confidence / 100;
+
+    } else {
+
+        percentage = confidence;
+
+    }
+
+    const safePercentage = Math.min(
+        100,
+        Math.max(0, percentage)
+    );
+
+    return `${safePercentage.toFixed(2)}%`;
+}
+
+
+// ------------------------------------------------------------
 // AUTH UI
 // ------------------------------------------------------------
 
@@ -126,17 +154,11 @@ function setAuthUI() {
     const logoutButton = $("#logoutBtn");
 
     if (loginButton) {
-        loginButton.classList.toggle(
-            "hidden",
-            loggedIn
-        );
+        loginButton.classList.toggle("hidden", loggedIn);
     }
 
     if (logoutButton) {
-        logoutButton.classList.toggle(
-            "hidden",
-            !loggedIn
-        );
+        logoutButton.classList.toggle("hidden", !loggedIn);
     }
 }
 
@@ -224,11 +246,8 @@ if ($("#authForm")) {
 
         event.preventDefault();
 
-        const email =
-            $("#email").value.trim();
-
-        const password =
-            $("#password").value;
+        const email = $("#email").value.trim();
+        const password = $("#password").value;
 
         if (!email || !password) {
 
@@ -258,8 +277,7 @@ if ($("#authForm")) {
                     method: "POST",
 
                     headers: {
-                        "Content-Type":
-                            "application/json"
+                        "Content-Type": "application/json"
                     },
 
                     body: JSON.stringify({
@@ -269,8 +287,7 @@ if ($("#authForm")) {
                 }
             );
 
-            const data =
-                await readResponse(response);
+            const data = await readResponse(response);
 
             if (!response.ok) {
 
@@ -296,22 +313,16 @@ if ($("#authForm")) {
 
             setAuthUI();
 
-            $("#loginOverlay")
-                .classList
-                .add("hidden");
+            $("#loginOverlay").classList.add("hidden");
 
             $("#authMsg").textContent = "";
 
         } catch (error) {
 
-            console.error(
-                "Authentication error:",
-                error
-            );
+            console.error("Authentication error:", error);
 
             $("#authMsg").textContent =
-                error.message ||
-                "Authentication failed.";
+                error.message || "Authentication failed.";
 
         } finally {
 
@@ -344,18 +355,13 @@ if ($("#logoutBtn")) {
 
         } catch (error) {
 
-            console.warn(
-                "Logout API failed:",
-                error
-            );
+            console.warn("Logout API failed:", error);
 
         } finally {
 
             token = "";
 
-            localStorage.removeItem(
-                "deepfake_token"
-            );
+            localStorage.removeItem("deepfake_token");
 
             setAuthUI();
 
@@ -372,8 +378,7 @@ if ($("#heroScan")) {
 
     $("#heroScan").onclick = () => {
 
-        const detector =
-            $("#detector");
+        const detector = $("#detector");
 
         if (detector) {
 
@@ -403,17 +408,13 @@ $$(".mode-tabs button").forEach((button) => {
 
     button.onclick = () => {
 
-        $$(".mode-tabs button")
-            .forEach((item) => {
-
-                item.classList.remove("active");
-
-            });
+        $$(".mode-tabs button").forEach((item) => {
+            item.classList.remove("active");
+        });
 
         button.classList.add("active");
 
-        mode =
-            button.dataset.mode || "image";
+        mode = button.dataset.mode || "image";
 
         if ($("#fileInput")) {
 
@@ -443,7 +444,9 @@ if ($("#dropzone")) {
             return;
         }
 
-        $("#fileInput").click();
+        if ($("#fileInput")) {
+            $("#fileInput").click();
+        }
 
     };
 }
@@ -459,7 +462,9 @@ if ($("#browseBtn")) {
 
         event.stopPropagation();
 
-        $("#fileInput").click();
+        if ($("#fileInput")) {
+            $("#fileInput").click();
+        }
 
     };
 }
@@ -473,8 +478,7 @@ if ($("#fileInput")) {
 
     $("#fileInput").onchange = (event) => {
 
-        const file =
-            event.target.files[0];
+        const file = event.target.files[0];
 
         selectFile(file);
 
@@ -496,9 +500,7 @@ if ($("#fileInput")) {
 
             event.preventDefault();
 
-            $("#dropzone")
-                .classList
-                .add("drag");
+            $("#dropzone").classList.add("drag");
 
         }
     );
@@ -520,9 +522,7 @@ if ($("#fileInput")) {
 
             event.preventDefault();
 
-            $("#dropzone")
-                .classList
-                .remove("drag");
+            $("#dropzone").classList.remove("drag");
 
         }
     );
@@ -540,8 +540,7 @@ if ($("#dropzone")) {
         "drop",
         (event) => {
 
-            const file =
-                event.dataTransfer.files[0];
+            const file = event.dataTransfer.files[0];
 
             selectFile(file);
 
@@ -558,95 +557,55 @@ function selectFile(file) {
 
     if (!file) return;
 
-    const isImage =
-        file.type.startsWith("image/");
+    const isImage = file.type.startsWith("image/");
+    const isVideo = file.type.startsWith("video/");
 
-    const isVideo =
-        file.type.startsWith("video/");
+    if (mode === "image" && !isImage) {
 
-
-    // Validate file type
-
-    if (
-        mode === "image" &&
-        !isImage
-    ) {
-
-        alert(
-            "Please choose an image file."
-        );
+        alert("Please choose an image file.");
 
         return;
     }
 
+    if (mode === "video" && !isVideo) {
 
-    if (
-        mode === "video" &&
-        !isVideo
-    ) {
-
-        alert(
-            "Please choose a video file."
-        );
+        alert("Please choose a video file.");
 
         return;
     }
-
 
     selectedFile = file;
 
-
-    // Update dropzone
-
     if ($("#dropzone")) {
-
-        $("#dropzone")
-            .classList
-            .add("has-preview");
-
+        $("#dropzone").classList.add("has-preview");
     }
 
-
-    const previewWrap =
-        $("#previewWrap");
-
-    const imagePreview =
-        $("#imagePreview");
-
-
-    // Image preview
+    const previewWrap = $("#previewWrap");
+    const imagePreview = $("#imagePreview");
 
     if (mode === "image") {
 
-        const previewURL =
-            URL.createObjectURL(file);
+        if (imagePreview && previewWrap) {
 
-        imagePreview.src =
-            previewURL;
+            const previewURL = URL.createObjectURL(file);
 
-        previewWrap
-            .classList
-            .remove("hidden");
+            imagePreview.src = previewURL;
 
-    }
+            previewWrap.classList.remove("hidden");
 
+        }
 
-    // Video
+    } else {
 
-    else {
+        if (imagePreview && previewWrap) {
 
-        imagePreview.removeAttribute(
-            "src"
-        );
+            imagePreview.removeAttribute("src");
 
-        previewWrap
-            .classList
-            .remove("hidden");
+            previewWrap.classList.remove("hidden");
+
+        }
 
     }
-
-
-    // Badge
 
     if ($("#previewBadge")) {
 
@@ -657,36 +616,22 @@ function selectFile(file) {
 
     }
 
-
-    // File information
-
     if ($("#fileMeta")) {
 
-        const size =
-            (
-                file.size /
-                1024 /
-                1024
-            ).toFixed(2);
+        const size = (
+            file.size / 1024 / 1024
+        ).toFixed(2);
 
         $("#fileMeta").textContent =
             `${file.name} · ${size} MB`;
 
-        $("#fileMeta")
-            .classList
-            .remove("hidden");
+        $("#fileMeta").classList.remove("hidden");
 
     }
-
-
-    // Enable analyze
 
     if ($("#analyzeBtn")) {
-
         $("#analyzeBtn").disabled = false;
-
     }
-
 
     resetSteps();
 
@@ -705,59 +650,40 @@ function resetFile() {
         $("#imagePreview").src.startsWith("blob:")
     ) {
 
-        URL.revokeObjectURL(
-            $("#imagePreview").src
+        URL.revokeObjectURL($("#imagePreview").src);
+
+    }
+
+    if ($("#imagePreview")) {
+        $("#imagePreview").removeAttribute("src");
+    }
+
+    if ($("#dropzone")) {
+
+        $("#dropzone").classList.remove(
+            "has-preview",
+            "scanning"
         );
 
     }
 
-
-    if ($("#dropzone")) {
-
-        $("#dropzone")
-            .classList
-            .remove(
-                "has-preview",
-                "scanning"
-            );
-
-    }
-
-
     if ($("#previewWrap")) {
-
-        $("#previewWrap")
-            .classList
-            .add("hidden");
-
+        $("#previewWrap").classList.add("hidden");
     }
-
 
     selectedFile = null;
 
-
     if ($("#fileInput")) {
-
         $("#fileInput").value = "";
-
     }
-
 
     if ($("#fileMeta")) {
-
-        $("#fileMeta")
-            .classList
-            .add("hidden");
-
+        $("#fileMeta").classList.add("hidden");
     }
-
 
     if ($("#analyzeBtn")) {
-
         $("#analyzeBtn").disabled = true;
-
     }
-
 
     resetSteps();
 
@@ -772,29 +698,18 @@ function resetSteps() {
 
     $$(".step").forEach((step) => {
 
-        step.classList.remove(
-            "active",
-            "done"
-        );
+        step.classList.remove("active", "done");
 
-        const status =
-            step.querySelector("em");
+        const status = step.querySelector("em");
 
         if (status) {
-
-            status.textContent =
-                "WAITING";
-
+            status.textContent = "WAITING";
         }
 
     });
 
-
     if ($("#pipelineStatus")) {
-
-        $("#pipelineStatus").textContent =
-            "IDLE";
-
+        $("#pipelineStatus").textContent = "IDLE";
     }
 
 }
@@ -807,9 +722,7 @@ function resetSteps() {
 function wait(ms) {
 
     return new Promise((resolve) => {
-
         setTimeout(resolve, ms);
-
     });
 
 }
@@ -823,134 +736,66 @@ async function analyze() {
 
     if (!selectedFile) {
 
-        alert(
-            "Please select an image or video first."
-        );
+        alert("Please select an image or video first.");
 
         return;
     }
-
 
     if (!token) {
 
-        $("#loginOverlay")
-            .classList
-            .remove("hidden");
+        if ($("#loginOverlay")) {
+            $("#loginOverlay").classList.remove("hidden");
+        }
 
         return;
     }
 
-
     if ($("#analyzeBtn")) {
-
         $("#analyzeBtn").disabled = true;
-
     }
-
 
     if ($("#dropzone")) {
-
-        $("#dropzone")
-            .classList
-            .add("scanning");
-
+        $("#dropzone").classList.add("scanning");
     }
 
-
-    const steps =
-        $$(".step");
-
+    const steps = $$(".step");
 
     if ($("#pipelineStatus")) {
-
-        $("#pipelineStatus").textContent =
-            "RUNNING";
-
+        $("#pipelineStatus").textContent = "RUNNING";
     }
-
 
     try {
 
-        // ----------------------------------------------------
-        // STEP 1 - VALIDATE
-        // ----------------------------------------------------
+        await runStep(steps[0], "VALIDATING");
 
-        await runStep(
-            steps[0],
-            "VALIDATING"
-        );
+        await runStep(steps[1], "EXTRACTING");
 
+        await runStep(steps[2], "LOCATING");
 
-        // ----------------------------------------------------
-        // STEP 2 - FRAME EXTRACTION
-        // ----------------------------------------------------
+        await runStep(steps[3], "ANALYZING");
 
-        await runStep(
-            steps[1],
-            "EXTRACTING"
-        );
+        const formData = new FormData();
 
-
-        // ----------------------------------------------------
-        // STEP 3 - FACE LOCATION
-        // ----------------------------------------------------
-
-        await runStep(
-            steps[2],
-            "LOCATING"
-        );
-
-
-        // ----------------------------------------------------
-        // STEP 4 - AI INFERENCE
-        // ----------------------------------------------------
-
-        await runStep(
-            steps[3],
-            "ANALYZING"
-        );
-
-
-        // ----------------------------------------------------
-        // SEND ACTUAL FILE TO YOUR OWN API
-        // ----------------------------------------------------
-
-        const formData =
-            new FormData();
-
-        formData.append(
-            "file",
-            selectedFile
-        );
-
+        formData.append("file", selectedFile);
 
         const endpoint =
             mode === "image"
                 ? "/api/detect-image"
                 : "/api/detect-video";
 
-
         if ($("#pipelineStatus")) {
-
-            $("#pipelineStatus").textContent =
-                "AI INFERENCE";
-
+            $("#pipelineStatus").textContent = "AI INFERENCE";
         }
 
+        const response = await api(
+            endpoint,
+            {
+                method: "POST",
+                body: formData
+            }
+        );
 
-        const response =
-            await api(
-                endpoint,
-                {
-                    method: "POST",
-                    body: formData
-                }
-            );
-
-
-        const data =
-            await readResponse(response);
-
+        const data = await readResponse(response);
 
         if (!response.ok) {
 
@@ -961,42 +806,21 @@ async function analyze() {
 
         }
 
-
-        // ----------------------------------------------------
-        // STEP 5 - VERDICT
-        // ----------------------------------------------------
-
         if (steps[4]) {
 
-            steps[4]
-                .classList
-                .add("done");
+            steps[4].classList.add("done");
 
-            const status =
-                steps[4]
-                    .querySelector("em");
+            const status = steps[4].querySelector("em");
 
             if (status) {
-
-                status.textContent =
-                    "DONE";
-
+                status.textContent = "DONE";
             }
 
         }
 
-
         if ($("#pipelineStatus")) {
-
-            $("#pipelineStatus").textContent =
-                "COMPLETE";
-
+            $("#pipelineStatus").textContent = "COMPLETE";
         }
-
-
-        // ----------------------------------------------------
-        // SHOW RESULT
-        // ----------------------------------------------------
 
         showResult(data);
 
@@ -1004,52 +828,28 @@ async function analyze() {
 
     catch (error) {
 
-        console.error(
-            "DeepFake analysis error:",
-            error
-        );
-
+        console.error("DeepFake analysis error:", error);
 
         if ($("#pipelineStatus")) {
-
-            $("#pipelineStatus").textContent =
-                "ERROR";
-
+            $("#pipelineStatus").textContent = "ERROR";
         }
 
-
         $$(".step").forEach((step) => {
-
-            step.classList.remove(
-                "active"
-            );
-
+            step.classList.remove("active");
         });
 
-
-        alert(
-            error.message ||
-            "Analysis failed."
-        );
+        alert(error.message || "Analysis failed.");
 
     }
 
     finally {
 
         if ($("#analyzeBtn")) {
-
-            $("#analyzeBtn").disabled =
-                false;
-
+            $("#analyzeBtn").disabled = false;
         }
 
-
         if ($("#dropzone")) {
-
-            $("#dropzone")
-                .classList
-                .remove("scanning");
-
+            $("#dropzone").classList.remove("scanning");
         }
 
     }
@@ -1067,14 +867,10 @@ async function runStep(step, runningText) {
 
     step.classList.add("active");
 
-    const status =
-        step.querySelector("em");
+    const status = step.querySelector("em");
 
     if (status) {
-
-        status.textContent =
-            runningText;
-
+        status.textContent = runningText;
     }
 
     await wait(550);
@@ -1084,10 +880,7 @@ async function runStep(step, runningText) {
     step.classList.add("done");
 
     if (status) {
-
-        status.textContent =
-            "DONE";
-
+        status.textContent = "DONE";
     }
 
 }
@@ -1098,10 +891,7 @@ async function runStep(step, runningText) {
 // ------------------------------------------------------------
 
 if ($("#analyzeBtn")) {
-
-    $("#analyzeBtn").onclick =
-        analyze;
-
+    $("#analyzeBtn").onclick = analyze;
 }
 
 
@@ -1114,76 +904,54 @@ function showResult(data) {
     if ($("#resultVerdict")) {
 
         $("#resultVerdict").textContent =
-            data.verdict ||
-            "Analysis complete";
+            data.verdict || "Analysis complete";
 
     }
-
 
     if ($("#resultScore")) {
 
-        const confidence =
-            Number(data.confidence || 0);
-
         $("#resultScore").textContent =
-            `${Math.round(
-                confidence * 100
-            )}%`;
+            formatConfidence(data.confidence);
 
     }
-
 
     if ($("#rMedia")) {
 
         $("#rMedia").textContent =
-            data.media_type ||
-            "-";
+            data.media_type || "-";
 
     }
-
 
     if ($("#rFrames")) {
 
         $("#rFrames").textContent =
-            data.frames ??
-            "-";
+            data.frames ?? "-";
 
     }
-
 
     if ($("#rFaces")) {
 
         $("#rFaces").textContent =
-            data.faces ??
-            "-";
+            data.faces ?? "-";
 
     }
-
 
     if ($("#rEngine")) {
 
         $("#rEngine").textContent =
-            data.engine ||
-            "-";
+            data.engine || "-";
 
     }
-
 
     if ($("#rNote")) {
 
         $("#rNote").textContent =
-            data.note ||
-            "No additional forensic note.";
+            data.note || "No additional forensic note.";
 
     }
 
-
     if ($("#resultModal")) {
-
-        $("#resultModal")
-            .classList
-            .remove("hidden");
-
+        $("#resultModal").classList.remove("hidden");
     }
 
 }
@@ -1197,9 +965,7 @@ if ($("#closeResult")) {
 
     $("#closeResult").onclick = () => {
 
-        $("#resultModal")
-            .classList
-            .add("hidden");
+        $("#resultModal").classList.add("hidden");
 
     };
 
@@ -1210,9 +976,7 @@ if ($("#resultDone")) {
 
     $("#resultDone").onclick = () => {
 
-        $("#resultModal")
-            .classList
-            .add("hidden");
+        $("#resultModal").classList.add("hidden");
 
     };
 
@@ -1229,55 +993,42 @@ if ($("#historyBtn")) {
 
         if (!token) {
 
-            $("#loginOverlay")
-                .classList
-                .remove("hidden");
+            $("#loginOverlay").classList.remove("hidden");
 
             return;
 
         }
 
+        $("#historyModal").classList.remove("hidden");
 
-        $("#historyModal")
-            .classList
-            .remove("hidden");
+        const historyBox = $("#historyList");
 
-
-        const historyBox =
-            $("#historyList");
-
+        if (!historyBox) return;
 
         historyBox.innerHTML =
             '<div class="history-empty">Loading...</div>';
 
-
         try {
 
-            const response =
-                await api(
-                    "/api/history"
-                );
+            const response = await api("/api/history");
 
-
-            const data =
-                await readResponse(response);
-
+            const data = await readResponse(response);
 
             if (!response.ok) {
 
                 throw new Error(
-                    data.detail ||
-                    "Unable to load history."
+                    data.detail || "Unable to load history."
                 );
 
             }
 
-
-            const rows =
-                Array.isArray(data)
-                    ? data
-                    : [];
-
+            const rows = Array.isArray(data)
+                ? data
+                : Array.isArray(data.history)
+                    ? data.history
+                    : Array.isArray(data.scans)
+                        ? data.scans
+                        : [];
 
             if (!rows.length) {
 
@@ -1288,68 +1039,58 @@ if ($("#historyBtn")) {
 
             }
 
+            historyBox.innerHTML = rows.map((item) => {
 
-            historyBox.innerHTML =
-                rows
-                    .map((item) => {
+                const filename = escapeHtml(
+                    item.filename || "Unknown file"
+                );
 
-                        return `
-                            <div class="history-item">
+                const mediaType = escapeHtml(
+                    String(item.media_type || "").toUpperCase()
+                );
 
-                                <b>
-                                    ${escapeHtml(
-                                        item.filename
-                                    )}
-                                </b>
+                const verdict = escapeHtml(
+                    item.verdict || ""
+                );
 
-                                <small>
-                                    ${escapeHtml(
-                                        String(
-                                            item.media_type ||
-                                            ""
-                                        ).toUpperCase()
-                                    )}
-                                    ·
-                                    ${escapeHtml(
-                                        item.verdict ||
-                                        ""
-                                    )}
-                                    ·
-                                    ${Math.round(
-                                        Number(
-                                            item.confidence ||
-                                            0
-                                        ) * 100
-                                    )}%
-                                    ·
-                                    ${item.created_at
-                                        ? new Date(
-                                            item.created_at
-                                        ).toLocaleString()
-                                        : ""}
-                                </small>
+                const confidence = formatConfidence(
+                    item.confidence
+                );
 
-                            </div>
-                        `;
+                const createdAt = item.created_at
+                    ? escapeHtml(
+                        new Date(item.created_at).toLocaleString()
+                    )
+                    : "";
 
-                    })
-                    .join("");
+                return `
+                    <div class="history-item">
+                        <b>${filename}</b>
+
+                        <small>
+                            ${mediaType}
+                            ·
+                            ${verdict}
+                            ·
+                            ${confidence}
+                            ·
+                            ${createdAt}
+                        </small>
+                    </div>
+                `;
+
+            }).join("");
 
         }
 
         catch (error) {
 
-            console.error(
-                "History error:",
-                error
-            );
-
+            console.error("History error:", error);
 
             historyBox.innerHTML = `
                 <div class="history-empty">
                     ${escapeHtml(
-                        error.message ||
-                        "Unable to load history."
+                        error.message || "Unable to load history."
                     )}
                 </div>
             `;
@@ -1369,9 +1110,7 @@ if ($("#closeHistory")) {
 
     $("#closeHistory").onclick = () => {
 
-        $("#historyModal")
-            .classList
-            .add("hidden");
+        $("#historyModal").classList.add("hidden");
 
     };
 
@@ -1386,9 +1125,7 @@ async function checkBackend() {
 
     try {
 
-        const response =
-            await api("/api/health");
-
+        const response = await api("/api/health");
 
         if (!response.ok) {
 
@@ -1401,16 +1138,9 @@ async function checkBackend() {
 
         }
 
+        const data = await readResponse(response);
 
-        const data =
-            await readResponse(response);
-
-
-        console.log(
-            "DeepFake backend:",
-            data
-        );
-
+        console.log("DeepFake backend:", data);
 
         return true;
 
@@ -1442,13 +1172,11 @@ function escapeHtml(value) {
             (character) => {
 
                 const entities = {
-
                     "&": "&amp;",
                     "<": "&lt;",
                     ">": "&gt;",
                     "'": "&#39;",
                     '"': "&quot;"
-
                 };
 
                 return entities[character];
@@ -1469,20 +1197,15 @@ document.addEventListener(
 
         setAuthUI();
 
-        const backendOnline =
-            await checkBackend();
+        const backendOnline = await checkBackend();
 
         if (backendOnline) {
 
-            console.log(
-                "✓ DeepFake API connected"
-            );
+            console.log("✓ DeepFake API connected");
 
         } else {
 
-            console.warn(
-                "⚠ DeepFake API is offline"
-            );
+            console.warn("⚠ DeepFake API is offline");
 
         }
 

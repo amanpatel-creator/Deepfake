@@ -1,217 +1,240 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr
-from pathlib import Path
-from datetime import datetime, timezone
-from PIL import Image
-import sqlite3
-import secrets
-import hashlib
+
 import os
 import io
+import cv2
+import json
+import uuid
+import hashlib
+import sqlite3
 import tempfile
-import threading
+import numpy as np
+import onnxruntime as ort
 
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
+from pathlib import Path
+from datetime import datetime
+from PIL import Image, ImageOps
+
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    HTTPException,
+    Header
+)
+
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 
 # =========================================================
-# MEMORY OPTIMIZATION
-# =========================================================
-
-# Keep CPU memory usage low on Render Free
-torch.set_num_threads(1)
-
-try:
-    torch.set_num_interop_threads(1)
-except RuntimeError:
-    pass
-
-
-# =========================================================
-# PATHS
+# 1. PATHS AND CONFIGURATION
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-FRONTEND_DIR = BASE_DIR / "frontend"
+MODEL_PATH = BASE_DIR / "models" / "deepfake_mobilenetv3.onnx"
+CONFIG_PATH = BASE_DIR / "models" / "deepfake_mobilenetv3_config.json"
 
 DB = Path(
-    os.getenv(
+    os.environ.get(
         "DB_PATH",
         str(BASE_DIR / "deepfake.db")
     )
 )
 
-DB.parent.mkdir(
-    parents=True,
-    exist_ok=True
-)
+FRONTEND_DIR = BASE_DIR / "frontend"
 
-MODEL_PATH = (
-    BASE_DIR
-    / "models"
-    / "deepfake_mobilenetv3.pth"
-)
-
-
-# =========================================================
-# LIMITS
-# =========================================================
-
-# Render Free memory optimization
-MAX_BYTES = 10 * 1024 * 1024
-
-# Maximum video frames to analyze
-MAX_VIDEO_FRAMES = 8
-
-
-# =========================================================
-# MODEL VARIABLES
-# =========================================================
-
-DEVICE = torch.device("cpu")
+MAX_IMAGE_SIZE = 15 * 1024 * 1024
+MAX_VIDEO_SIZE = 100 * 1024 * 1024
 
 MODEL = None
-CHECKPOINT = None
-MODEL_LOAD_ERROR = None
-
-MODEL_LOCK = threading.Lock()
-
-IMAGE_SIZE = 224
-IMAGE_TRANSFORM = None
+MODEL_CONFIG = None
 
 CLASS_MAP = {
     "real": 0,
     "fake": 1
 }
 
+IMAGE_SIZE = 224
+
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
+
 
 # =========================================================
-# FASTAPI APP
+# 2. FASTAPI APPLICATION
 # =========================================================
 
 app = FastAPI(
     title="DeepFAke AI",
-    version="2.0.0"
+    description="AI Based Deepfake Detection System",
+    version="2.1.0"
 )
-
-
-# =========================================================
-# CORS
-# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
 # =========================================================
-# DATABASE
+# 3. DATABASE CONNECTION
 # =========================================================
 
-def db():
-    connection = sqlite3.connect(
-        DB,
-        check_same_thread=False
+def get_connection():
+
+    conn = sqlite3.connect(
+        str(DB),
+        timeout=30
     )
 
-    connection.row_factory = sqlite3.Row
+    conn.row_factory = sqlite3.Row
 
-    return connection
+    conn.execute("PRAGMA busy_timeout = 30000")
 
-
-def init_db():
-
-    connection = db()
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS scans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT NOT NULL,
-            media_type TEXT NOT NULL,
-            verdict TEXT,
-            confidence REAL,
-            real_probability REAL,
-            fake_probability REAL,
-            faces INTEGER,
-            frames INTEGER,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-
-    connection.commit()
-
-    connection.close()
-
-
-init_db()
+    return conn
 
 
 # =========================================================
-# AUTHENTICATION
+# 4. DATABASE INITIALIZATION AND MIGRATION
 # =========================================================
 
-class AuthIn(BaseModel):
-    email: EmailStr
-    password: str
+def init_database():
+
+    conn = get_connection()
+
+    try:
+
+        conn.execute("PRAGMA journal_mode = WAL")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                filename TEXT,
+                media_type TEXT,
+                verdict TEXT,
+                confidence REAL,
+                real_probability REAL,
+                fake_probability REAL,
+                faces INTEGER DEFAULT 0,
+                frames INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        """)
+
+        # Add missing columns to an existing scans table.
+        existing_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(scans)"
+            ).fetchall()
+        }
+
+        migrations = {
+            "user_id": "INTEGER",
+            "filename": "TEXT",
+            "media_type": "TEXT",
+            "verdict": "TEXT",
+            "confidence": "REAL",
+            "real_probability": "REAL",
+            "fake_probability": "REAL",
+            "faces": "INTEGER DEFAULT 0",
+            "frames": "INTEGER DEFAULT 0",
+            "created_at": "TEXT"
+        }
+
+        for column, definition in migrations.items():
+
+            if column not in existing_columns:
+
+                conn.execute(
+                    f"ALTER TABLE scans ADD COLUMN {column} {definition}"
+                )
+
+        # Fill missing timestamps in old records.
+        conn.execute("""
+            UPDATE scans
+            SET created_at = ?
+            WHERE created_at IS NULL OR created_at = ''
+        """, (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
+
+        conn.commit()
+
+        print("SQLite database initialized successfully.")
+
+    except Exception:
+
+        conn.rollback()
+        raise
+
+    finally:
+
+        conn.close()
 
 
-def hash_password(password: str) -> str:
+init_database()
+
+
+# =========================================================
+# 5. AUTHENTICATION HELPERS
+# =========================================================
+
+def hash_password(password):
 
     return hashlib.sha256(
         password.encode("utf-8")
     ).hexdigest()
 
 
-def token_from_header(
-    authorization: str
-):
+def create_session(user_id):
 
-    if not authorization:
-        return None
+    token = str(uuid.uuid4())
 
-    if not authorization.startswith("Bearer "):
-        return None
+    conn = get_connection()
 
-    return authorization.replace(
-        "Bearer ",
-        "",
-        1
-    ).strip()
+    try:
+
+        conn.execute("""
+            INSERT INTO sessions (token, user_id, created_at)
+            VALUES (?, ?, ?)
+        """, (
+            token,
+            user_id,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+        conn.commit()
+
+    finally:
+
+        conn.close()
+
+    return token
 
 
 def get_user(token):
@@ -219,619 +242,328 @@ def get_user(token):
     if not token:
         return None
 
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT users.*
-        FROM sessions
-        JOIN users
-        ON users.id = sessions.user_id
-        WHERE sessions.token = ?
-        """,
-        (token,)
-    ).fetchone()
-
-    connection.close()
-
-    if row:
-        return dict(row)
-
-    return None
-
-
-# =========================================================
-# REGISTER
-# =========================================================
-
-@app.post("/api/register")
-def register(data: AuthIn):
-
-    email = str(data.email).lower().strip()
-
-    if len(data.password) < 6:
-        raise HTTPException(
-            status_code=400,
-            detail="Password must contain at least 6 characters."
-        )
-
-    connection = db()
+    conn = get_connection()
 
     try:
 
-        cursor = connection.execute(
-            """
-            INSERT INTO users (
-                email,
-                password_hash,
-                created_at
-            )
-            VALUES (?, ?, ?)
-            """,
-            (
-                email,
-                hash_password(data.password),
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-            )
-        )
+        row = conn.execute("""
+            SELECT users.id, users.email
+            FROM users
+            JOIN sessions
+            ON users.id = sessions.user_id
+            WHERE sessions.token = ?
+        """, (token,)).fetchone()
 
-        connection.commit()
+        return dict(row) if row else None
 
-        user_id = cursor.lastrowid
+    finally:
 
-    except sqlite3.IntegrityError:
+        conn.close()
 
-        connection.close()
 
-        raise HTTPException(
-            status_code=409,
-            detail="Email already registered."
-        )
+def get_current_user(authorization):
 
-    connection.close()
+    if not authorization:
+        return None
 
-    token = secrets.token_urlsafe(32)
+    if not authorization.startswith("Bearer "):
+        return None
 
-    connection = db()
+    token = authorization.replace(
+        "Bearer ", "", 1
+    ).strip()
 
-    connection.execute(
-        """
-        INSERT INTO sessions (
-            token,
-            user_id,
-            created_at
-        )
-        VALUES (?, ?, ?)
-        """,
-        (
-            token,
-            user_id,
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
-    )
-
-    connection.commit()
-
-    connection.close()
-
-    return {
-        "status": "success",
-        "message": "Registration successful.",
-        "token": token
-    }
+    return get_user(token)
 
 
 # =========================================================
-# LOGIN
-# =========================================================
-
-@app.post("/api/login")
-def login(data: AuthIn):
-
-    email = str(data.email).lower().strip()
-
-    connection = db()
-
-    user = connection.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE email = ?
-        """,
-        (email,)
-    ).fetchone()
-
-    connection.close()
-
-    if not user:
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password."
-        )
-
-    if user["password_hash"] != hash_password(
-        data.password
-    ):
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password."
-        )
-
-    token = secrets.token_urlsafe(32)
-
-    connection = db()
-
-    connection.execute(
-        """
-        INSERT INTO sessions (
-            token,
-            user_id,
-            created_at
-        )
-        VALUES (?, ?, ?)
-        """,
-        (
-            token,
-            user["id"],
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
-    )
-
-    connection.commit()
-
-    connection.close()
-
-    return {
-        "status": "success",
-        "message": "Login successful.",
-        "token": token
-    }
-
-
-# =========================================================
-# CURRENT USER
-# =========================================================
-
-@app.get("/api/me")
-def me(
-    authorization: str = Header(default="")
-):
-
-    user = get_user(
-        token_from_header(authorization)
-    )
-
-    if not user:
-
-        raise HTTPException(
-            status_code=401,
-            detail="Not authenticated."
-        )
-
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "created_at": user["created_at"]
-    }
-
-
-# =========================================================
-# LOGOUT
-# =========================================================
-
-@app.post("/api/logout")
-def logout(
-    authorization: str = Header(default="")
-):
-
-    token = token_from_header(
-        authorization
-    )
-
-    if token:
-
-        connection = db()
-
-        connection.execute(
-            """
-            DELETE FROM sessions
-            WHERE token = ?
-            """,
-            (token,)
-        )
-
-        connection.commit()
-
-        connection.close()
-
-    return {
-        "status": "success",
-        "message": "Logged out successfully."
-    }
-
-
-# =========================================================
-# SAVE SCAN
+# 6. SAVE SCAN
 # =========================================================
 
 def save_scan(
     user_id,
     filename,
     media_type,
-    result
+    verdict,
+    confidence,
+    real_probability,
+    fake_probability,
+    faces=0,
+    frames=0
 ):
 
-    connection = db()
+    if not user_id:
+        return
 
-    connection.execute(
-        """
-        INSERT INTO scans (
+    conn = get_connection()
+
+    try:
+
+        now = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        conn.execute("""
+            INSERT INTO scans (
+                user_id,
+                filename,
+                media_type,
+                verdict,
+                confidence,
+                real_probability,
+                fake_probability,
+                faces,
+                frames,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             user_id,
             filename,
             media_type,
             verdict,
-            confidence,
-            real_probability,
-            fake_probability,
-            faces,
-            frames,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            filename,
-            media_type,
-            result.get("verdict"),
-            result.get("confidence"),
-            result.get("real_probability"),
-            result.get("fake_probability"),
-            result.get("faces", 0),
-            result.get("frames", 0),
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
-    )
+            float(confidence),
+            float(real_probability),
+            float(fake_probability),
+            int(faces),
+            int(frames),
+            now
+        ))
 
-    connection.commit()
+        conn.commit()
 
-    connection.close()
+    except Exception:
+
+        conn.rollback()
+        raise
+
+    finally:
+
+        conn.close()
 
 
 # =========================================================
-# MODEL LOADING
+# 7. LOAD ONNX MODEL
 # =========================================================
 
 def load_model():
 
     global MODEL
-    global CHECKPOINT
-    global MODEL_LOAD_ERROR
-    global IMAGE_SIZE
-    global IMAGE_TRANSFORM
+    global MODEL_CONFIG
     global CLASS_MAP
+    global IMAGE_SIZE
+    global MEAN
+    global STD
 
-    try:
+    if not MODEL_PATH.exists():
 
-        if not MODEL_PATH.exists():
-
-            raise FileNotFoundError(
-                f"Model checkpoint not found: {MODEL_PATH}"
-            )
-
-        checkpoint = torch.load(
-            MODEL_PATH,
-            map_location="cpu",
-            weights_only=False
+        raise FileNotFoundError(
+            f"ONNX model missing: {MODEL_PATH}"
         )
 
-        if checkpoint.get(
-            "architecture"
-        ) != "mobilenet_v3_small":
+    if not CONFIG_PATH.exists():
 
-            raise ValueError(
-                "Unsupported model architecture."
-            )
-
-        class_map = checkpoint.get(
-            "class_map",
-            {}
+        raise FileNotFoundError(
+            f"Model config missing: {CONFIG_PATH}"
         )
 
-        if (
-            "real" not in class_map
-            or "fake" not in class_map
-        ):
+    with open(
+        CONFIG_PATH,
+        "r",
+        encoding="utf-8"
+    ) as file:
 
-            raise ValueError(
-                "Checkpoint has an invalid class map."
-            )
+        MODEL_CONFIG = json.load(file)
 
-        # Create MobileNetV3-Small
-        model = models.mobilenet_v3_small(
-            weights=None
-        )
+    IMAGE_SIZE = int(
+        MODEL_CONFIG.get("image_size", 224)
+    )
 
-        in_features = (
-            model.classifier[3].in_features
-        )
+    MEAN = MODEL_CONFIG.get(
+        "mean",
+        [0.485, 0.456, 0.406]
+    )
 
-        model.classifier[3] = nn.Linear(
-            in_features,
-            2
-        )
+    STD = MODEL_CONFIG.get(
+        "std",
+        [0.229, 0.224, 0.225]
+    )
 
-        # Load trained weights
-        model.load_state_dict(
-            checkpoint["model_state_dict"],
-            strict=True
-        )
+    CLASS_MAP = MODEL_CONFIG.get(
+        "class_map",
+        {"real": 0, "fake": 1}
+    )
 
-        model.eval()
+    options = ort.SessionOptions()
 
-        model.to(DEVICE)
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
 
-        # Image configuration
-        IMAGE_SIZE = int(
-            checkpoint.get(
-                "image_size",
-                224
-            )
-        )
+    options.execution_mode = (
+        ort.ExecutionMode.ORT_SEQUENTIAL
+    )
 
-        mean = checkpoint.get(
-            "mean",
-            [
-                0.485,
-                0.456,
-                0.406
-            ]
-        )
+    MODEL = ort.InferenceSession(
+        str(MODEL_PATH),
+        sess_options=options,
+        providers=["CPUExecutionProvider"]
+    )
 
-        std = checkpoint.get(
-            "std",
-            [
-                0.229,
-                0.224,
-                0.225
-            ]
-        )
+    print("DeepFAke AI: trained ONNX MobileNetV3 model loaded.")
+    print("Class map:", CLASS_MAP)
+    print("Image size:", IMAGE_SIZE)
 
-        CLASS_MAP = {
-            "real": int(
-                class_map["real"]
-            ),
-            "fake": int(
-                class_map["fake"]
-            )
-        }
+    print(
+        "Saved validation accuracy:",
+        MODEL_CONFIG.get("best_val_accuracy")
+    )
 
-        # Create transform only once
-        IMAGE_TRANSFORM = transforms.Compose(
-            [
-                transforms.Resize(
-                    (
-                        IMAGE_SIZE,
-                        IMAGE_SIZE
-                    )
-                ),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=mean,
-                    std=std
-                )
-            ]
-        )
-
-        MODEL = model
-
-        # IMPORTANT:
-        # Keep only lightweight checkpoint information.
-        # Do NOT keep model_state_dict in RAM.
-        CHECKPOINT = {
-            "architecture":
-                "mobilenet_v3_small",
-
-            "image_size":
-                IMAGE_SIZE,
-
-            "mean":
-                mean,
-
-            "std":
-                std,
-
-            "class_map":
-                CLASS_MAP,
-
-            "best_val_accuracy":
-                checkpoint.get(
-                    "best_val_accuracy"
-                )
-        }
-
-        # Free original checkpoint RAM
-        del checkpoint
-
-        MODEL_LOAD_ERROR = None
-
-        print(
-            "DeepFAke AI: trained MobileNetV3 model loaded."
-        )
-
-        print(
-            "Class map:",
-            CLASS_MAP
-        )
-
-        print(
-            "Saved validation accuracy:",
-            CHECKPOINT.get(
-                "best_val_accuracy"
-            )
-        )
-
-    except Exception as error:
-
-        MODEL = None
-
-        CHECKPOINT = None
-
-        IMAGE_TRANSFORM = None
-
-        MODEL_LOAD_ERROR = str(error)
-
-        print(
-            "MODEL LOAD ERROR:",
-            MODEL_LOAD_ERROR
-        )
-
-
-load_model()
+    print(
+        "ONNX Runtime provider:",
+        MODEL.get_providers()
+    )
 
 
 # =========================================================
-# IMAGE TRANSFORM
+# 8. IMAGE PREPROCESSING
 # =========================================================
 
-def get_transform():
+def preprocess_image(image):
 
-    if IMAGE_TRANSFORM is None:
+    image = ImageOps.exif_transpose(image)
 
-        raise RuntimeError(
-            "Image transform is not initialized."
-        )
+    image = image.convert("RGB")
 
-    return IMAGE_TRANSFORM
+    image = image.resize(
+        (IMAGE_SIZE, IMAGE_SIZE),
+        Image.Resampling.BILINEAR
+    )
+
+    image_array = np.asarray(
+        image,
+        dtype=np.float32
+    ) / 255.0
+
+    mean = np.asarray(
+        MEAN,
+        dtype=np.float32
+    ).reshape(1, 1, 3)
+
+    std = np.asarray(
+        STD,
+        dtype=np.float32
+    ).reshape(1, 1, 3)
+
+    image_array = (
+        image_array - mean
+    ) / std
+
+    image_array = np.transpose(
+        image_array,
+        (2, 0, 1)
+    )
+
+    image_array = np.expand_dims(
+        image_array,
+        axis=0
+    )
+
+    return image_array.astype(np.float32)
 
 
 # =========================================================
-# IMAGE PREDICTION
+# 9. AI PREDICTION
 # =========================================================
 
 def predict_image(image):
 
     if MODEL is None:
 
-        raise RuntimeError(
-            f"Trained model unavailable: "
-            f"{MODEL_LOAD_ERROR}"
+        raise HTTPException(
+            status_code=503,
+            detail="AI model is not loaded"
         )
 
-    image = image.convert("RGB")
+    input_data = preprocess_image(image)
 
-    tensor = IMAGE_TRANSFORM(
-        image
-    ).unsqueeze(0)
+    input_name = MODEL.get_inputs()[0].name
 
-    with MODEL_LOCK:
+    output = MODEL.run(
+        None,
+        {input_name: input_data}
+    )[0]
 
-        with torch.inference_mode():
+    logits = np.asarray(
+        output,
+        dtype=np.float32
+    ).reshape(-1)
 
-            output = MODEL(
-                tensor
-            )
+    if len(logits) != 2:
 
-            probabilities = torch.softmax(
-                output,
-                dim=1
-            )[0]
+        raise RuntimeError(
+            "Model must return two class scores"
+        )
+
+    logits = logits - np.max(logits)
+
+    probabilities = np.exp(logits)
+
+    probabilities = (
+        probabilities / np.sum(probabilities)
+    )
 
     real_index = CLASS_MAP["real"]
-
     fake_index = CLASS_MAP["fake"]
 
     real_probability = float(
-        probabilities[
-            real_index
-        ].item()
+        probabilities[real_index] * 100
     )
 
     fake_probability = float(
-        probabilities[
-            fake_index
-        ].item()
+        probabilities[fake_index] * 100
     )
 
-    is_fake = (
-        fake_probability
-        >= real_probability
-    )
+    if fake_probability >= real_probability:
 
-    # Free temporary tensors
-    del tensor
-    del output
-    del probabilities
+        verdict = "LIKELY FAKE"
+        predicted_class = "fake"
+        confidence = fake_probability
+
+    else:
+
+        verdict = "LIKELY REAL"
+        predicted_class = "real"
+        confidence = real_probability
+
+    if confidence >= 80:
+        confidence_level = "High"
+
+    elif confidence >= 65:
+        confidence_level = "Moderate"
+
+    else:
+        confidence_level = "Low"
 
     return {
-
-        "verdict":
-            (
-                "Likely fake"
-                if is_fake
-                else "Likely authentic"
-            ),
-
-        "confidence":
-            max(
-                real_probability,
-                fake_probability
-            ),
-
-        "real_probability":
-            real_probability,
-
-        "fake_probability":
-            fake_probability,
-
-        "predicted_class":
-            (
-                "fake"
-                if is_fake
-                else "real"
-            )
+        "verdict": verdict,
+        "predicted_class": predicted_class,
+        "confidence": round(confidence, 2),
+        "real_probability": round(real_probability, 2),
+        "fake_probability": round(fake_probability, 2),
+        "confidence_level": confidence_level
     }
 
 
 # =========================================================
-# FACE DETECTION
+# 10. FACE DETECTION
 # =========================================================
 
-def count_faces(image):
+def detect_faces(image):
 
     try:
 
-        import cv2
-        import numpy as np
-
-        # Reduce image size before OpenCV processing
-        small = image.copy()
-
-        small.thumbnail(
-            (
-                800,
-                800
-            )
-        )
-
-        rgb = np.asarray(
-            small.convert("RGB")
-        )
-
-        gray = cv2.cvtColor(
-            rgb,
-            cv2.COLOR_RGB2GRAY
-        )
+        if not hasattr(cv2, "CascadeClassifier"):
+            return 0
 
         cascade_path = (
             cv2.data.haarcascades
@@ -843,567 +575,635 @@ def count_faces(image):
         )
 
         if detector.empty():
-
             return 0
+
+        image_array = np.asarray(
+            image.convert("RGB")
+        )
+
+        gray = cv2.cvtColor(
+            image_array,
+            cv2.COLOR_RGB2GRAY
+        )
 
         faces = detector.detectMultiScale(
             gray,
             scaleFactor=1.1,
-            minNeighbors=5
+            minNeighbors=5,
+            minSize=(30, 30)
         )
 
         return len(faces)
 
-    except Exception:
+    except Exception as error:
+
+        print("Face detection warning:", error)
 
         return 0
 
 
 # =========================================================
-# HEALTH CHECK
+# 11. REGISTER
 # =========================================================
 
-@app.get("/api/health")
-def health():
+@app.post("/api/register")
+async def register(data: dict):
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
+    password = str(
+        data.get("password", "")
+    )
+
+    if not email or not password:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Email and password are required"
+        )
+
+    if len(password) < 6:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Password must contain at least 6 characters"
+        )
+
+    conn = get_connection()
+
+    try:
+
+        existing = conn.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (email,)
+        ).fetchone()
+
+        if existing:
+
+            raise HTTPException(
+                status_code=409,
+                detail="Account already exists"
+            )
+
+        cursor = conn.execute("""
+            INSERT INTO users (
+                email,
+                password_hash,
+                created_at
+            )
+            VALUES (?, ?, ?)
+        """, (
+            email,
+            hash_password(password),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+
+        user_id = cursor.lastrowid
+
+        conn.commit()
+
+    finally:
+
+        conn.close()
+
+    token = create_session(user_id)
 
     return {
-
-        "status":
-            "ok",
-
-        "service":
-            "DeepFAke AI",
-
-        "model_ready":
-            MODEL is not None,
-
-        "mode":
-            (
-                "trained_mobilenetv3"
-                if MODEL
-                else "model_unavailable"
-            ),
-
-        "device":
-            str(DEVICE),
-
-        "model_error":
-            MODEL_LOAD_ERROR
+        "status": "success",
+        "message": "Registration successful",
+        "token": token
     }
 
 
 # =========================================================
-# IMAGE DETECTION
+# 12. LOGIN
+# =========================================================
+
+@app.post("/api/login")
+async def login(data: dict):
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
+    password = str(
+        data.get("password", "")
+    )
+
+    conn = get_connection()
+
+    try:
+
+        user = conn.execute("""
+            SELECT id, email, password_hash
+            FROM users
+            WHERE email = ?
+        """, (email,)).fetchone()
+
+    finally:
+
+        conn.close()
+
+    if not user:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    if user["password_hash"] != hash_password(password):
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    token = create_session(user["id"])
+
+    return {
+        "status": "success",
+        "message": "Login successful",
+        "token": token
+    }
+
+
+# =========================================================
+# 13. CURRENT USER
+# =========================================================
+
+@app.get("/api/me")
+async def me(
+    authorization: str = Header(default=None)
+):
+
+    user = get_current_user(authorization)
+
+    if not user:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    return {
+        "status": "success",
+        "user": user
+    }
+
+
+# =========================================================
+# 14. LOGOUT
+# =========================================================
+
+@app.post("/api/logout")
+async def logout(
+    authorization: str = Header(default=None)
+):
+
+    if not authorization or not authorization.startswith("Bearer "):
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+    token = authorization.replace(
+        "Bearer ", "", 1
+    ).strip()
+
+    conn = get_connection()
+
+    try:
+
+        conn.execute(
+            "DELETE FROM sessions WHERE token = ?",
+            (token,)
+        )
+
+        conn.commit()
+
+    finally:
+
+        conn.close()
+
+    return {
+        "status": "success",
+        "message": "Logged out successfully"
+    }
+
+
+# =========================================================
+# 15. SCAN HISTORY
+# =========================================================
+
+@app.get("/api/history")
+async def get_history(
+    authorization: str = Header(default=None)
+):
+
+    user = get_current_user(authorization)
+
+    if not user:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Please login to view history"
+        )
+
+    conn = get_connection()
+
+    try:
+
+        rows = conn.execute("""
+            SELECT
+                id,
+                filename,
+                media_type,
+                verdict,
+                confidence,
+                real_probability,
+                fake_probability,
+                faces,
+                frames,
+                created_at
+            FROM scans
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 50
+        """, (user["id"],)).fetchall()
+
+        history = [
+            dict(row)
+            for row in rows
+        ]
+
+    finally:
+
+        conn.close()
+
+    return {
+        "status": "success",
+        "history": history,
+        "scans": history,
+        "total": len(history)
+    }
+
+
+# =========================================================
+# 16. IMAGE DETECTION
 # =========================================================
 
 @app.post("/api/detect-image")
 async def detect_image(
-
     file: UploadFile = File(...),
-
-    authorization: str = Header(
-        default=""
-    )
+    authorization: str = Header(default=None)
 ):
 
-    # Read only maximum allowed amount
-    data = await file.read(
-        MAX_BYTES + 1
+    allowed = (
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp"
     )
 
-    if not data:
+    filename = file.filename or "uploaded_image"
+
+    extension = Path(filename).suffix.lower()
+
+    if extension not in allowed:
 
         raise HTTPException(
             status_code=400,
-            detail="Empty image file."
+            detail="Unsupported image format"
         )
 
-    if len(data) > MAX_BYTES:
+    image_bytes = await file.read()
+
+    if len(image_bytes) > MAX_IMAGE_SIZE:
 
         raise HTTPException(
             status_code=413,
-            detail=(
-                "File too large. "
-                "Maximum image size is 10 MB."
-            )
+            detail="Image size must be below 15 MB"
         )
 
     try:
 
         image = Image.open(
-            io.BytesIO(data)
+            io.BytesIO(image_bytes)
+        )
+
+        image.load()
+
+        image = ImageOps.exif_transpose(
+            image
         ).convert("RGB")
 
     except Exception:
 
         raise HTTPException(
             status_code=400,
-            detail="Invalid image file."
+            detail="Invalid image file"
         )
 
-    try:
+    result = predict_image(image)
 
-        prediction = predict_image(
-            image
+    faces = detect_faces(image)
+
+    user = get_current_user(authorization)
+
+    if user:
+
+        save_scan(
+            user_id=user["id"],
+            filename=filename,
+            media_type="image",
+            verdict=result["verdict"],
+            confidence=result["confidence"],
+            real_probability=result["real_probability"],
+            fake_probability=result["fake_probability"],
+            faces=faces,
+            frames=1
         )
 
-    except Exception as error:
-
-        del image
-        del data
-
-        raise HTTPException(
-            status_code=503,
-            detail=str(error)
-        )
-
-    faces = count_faces(
-        image
-    )
-
-    result = {
-
-        **prediction,
-
-        "frames":
-            1,
-
-        "faces":
-            faces
-    }
-
-    user = get_user(
-        token_from_header(
-            authorization
-        )
-    )
-
-    save_scan(
-
-        user["id"]
-        if user
-        else None,
-
-        file.filename
-        or "image",
-
-        "image",
-
-        result
-    )
-
-    response = {
-
-        "status":
-            "Complete",
-
+    return {
+        "status": "Complete",
+        "filename": filename,
+        "media_type": "image",
+        "engine": "ONNX Runtime - MobileNetV3",
         **result,
-
-        "media_type":
-            "image",
-
-        "engine":
-            "MobileNetV3-Small",
-
-        "confidence_level":
-            "MODEL SCORE - NOT CALIBRATED",
-
-        "note":
-            (
-                "Prediction generated by "
-                "the trained MobileNetV3 model. "
-                "The score is not a calibrated "
-                "probability or a guarantee "
-                "of authenticity."
-            )
+        "faces": faces,
+        "frames": 1,
+        "note": "AI prediction is an estimate, not definitive proof."
     }
-
-    # Free memory
-    del image
-    del data
-
-    return response
 
 
 # =========================================================
-# VIDEO DETECTION
+# 17. VIDEO DETECTION
 # =========================================================
 
 @app.post("/api/detect-video")
 async def detect_video(
-
     file: UploadFile = File(...),
-
-    authorization: str = Header(
-        default=""
-    )
+    authorization: str = Header(default=None)
 ):
 
-    filename = (
-        file.filename
-        or "video"
-    )
-
-    extension = (
-        Path(filename)
-        .suffix
-        .lower()
-    )
-
-    allowed_extensions = {
-
+    allowed = (
         ".mp4",
         ".avi",
         ".mov",
-        ".mkv",
-        ".webm",
-        ".mpeg",
-        ".mpg"
-    }
-
-    if extension not in allowed_extensions:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unsupported video format."
-            )
-        )
-
-    data = await file.read(
-        MAX_BYTES + 1
+        ".mkv"
     )
 
-    if not data:
+    filename = file.filename or "uploaded_video"
+
+    extension = Path(filename).suffix.lower()
+
+    if extension not in allowed:
 
         raise HTTPException(
             status_code=400,
-            detail="Empty video file."
+            detail="Unsupported video format"
         )
 
-    if len(data) > MAX_BYTES:
+    video_bytes = await file.read()
+
+    if not video_bytes:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Empty video file"
+        )
+
+    if len(video_bytes) > MAX_VIDEO_SIZE:
 
         raise HTTPException(
             status_code=413,
-            detail=(
-                "File too large. "
-                "Maximum video size is 10 MB."
-            )
+            detail="Video size must be below 100 MB"
         )
 
     temp_path = None
+    capture = None
 
     try:
 
         with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=extension
+            suffix=extension,
+            delete=False
         ) as temp_file:
 
-            temp_file.write(data)
+            temp_file.write(video_bytes)
 
             temp_path = temp_file.name
 
-        del data
-
-        import cv2
-
-        capture = cv2.VideoCapture(
-            temp_path
-        )
+        capture = cv2.VideoCapture(temp_path)
 
         if not capture.isOpened():
 
             raise HTTPException(
                 status_code=400,
-                detail="Could not open video."
+                detail="Unable to read video"
             )
 
         total_frames = int(
-            capture.get(
-                cv2.CAP_PROP_FRAME_COUNT
-            )
-        )
-
-        fps = float(
-            capture.get(
-                cv2.CAP_PROP_FPS
-            )
-        )
-
-        if fps <= 0:
-
-            fps = 25.0
-
-        duration = (
-            total_frames / fps
-            if total_frames > 0
-            else 0
+            capture.get(cv2.CAP_PROP_FRAME_COUNT)
         )
 
         if total_frames <= 0:
 
-            capture.release()
-
             raise HTTPException(
                 status_code=400,
-                detail="Video contains no readable frames."
+                detail="Video contains no readable frames"
             )
 
         sample_count = min(
-            MAX_VIDEO_FRAMES,
+            8,
             total_frames
         )
 
-        if sample_count <= 0:
+        positions = np.linspace(
+            0,
+            total_frames - 1,
+            sample_count,
+            dtype=int
+        )
 
-            capture.release()
+        predictions = []
+        face_count = 0
+        processed_frames = 0
 
-            raise HTTPException(
-                status_code=400,
-                detail="No frames available for analysis."
-            )
-
-        if sample_count == 1:
-
-            frame_indexes = [0]
-
-        else:
-
-            frame_indexes = [
-
-                int(
-                    i * (
-                        total_frames - 1
-                    ) / (
-                        sample_count - 1
-                    )
-                )
-
-                for i in range(
-                    sample_count
-                )
-            ]
-
-        real_scores = []
-
-        fake_scores = []
-
-        faces_total = 0
-
-        frames_processed = 0
-
-        for frame_index in frame_indexes:
+        for position in positions:
 
             capture.set(
                 cv2.CAP_PROP_POS_FRAMES,
-                frame_index
+                int(position)
             )
 
-            success, frame = (
-                capture.read()
-            )
+            success, frame = capture.read()
 
             if not success:
-
                 continue
 
-            try:
+            frame_rgb = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
+            )
 
-                rgb = cv2.cvtColor(
-                    frame,
-                    cv2.COLOR_BGR2RGB
-                )
+            frame_image = Image.fromarray(
+                frame_rgb
+            )
 
-                pil_image = Image.fromarray(
-                    rgb
-                )
+            result = predict_image(frame_image)
 
-                prediction = predict_image(
-                    pil_image
-                )
+            predictions.append((
+                result["real_probability"],
+                result["fake_probability"]
+            ))
 
-                real_scores.append(
-                    prediction[
-                        "real_probability"
-                    ]
-                )
+            face_count += detect_faces(frame_image)
 
-                fake_scores.append(
-                    prediction[
-                        "fake_probability"
-                    ]
-                )
-
-                faces_total += count_faces(
-                    pil_image
-                )
-
-                frames_processed += 1
-
-                del rgb
-                del pil_image
-
-            finally:
-
-                del frame
+            processed_frames += 1
 
         capture.release()
+        capture = None
 
-        if not real_scores:
+        if not predictions:
 
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Could not process any "
-                    "video frames."
-                )
+                detail="Unable to process video frames"
             )
 
-        real_probability = (
-            sum(real_scores)
-            / len(real_scores)
+        real_probability = float(
+            np.mean([
+                item[0] for item in predictions
+            ])
         )
 
-        fake_probability = (
-            sum(fake_scores)
-            / len(fake_scores)
+        fake_probability = float(
+            np.mean([
+                item[1] for item in predictions
+            ])
         )
 
-        is_fake = (
-            fake_probability
-            >= real_probability
-        )
+        if fake_probability >= real_probability:
 
-        confidence = max(
-            real_probability,
-            fake_probability
-        )
+            verdict = "LIKELY FAKE"
+            predicted_class = "fake"
+            confidence = fake_probability
+
+        else:
+
+            verdict = "LIKELY REAL"
+            predicted_class = "real"
+            confidence = real_probability
+
+        if confidence >= 80:
+            confidence_level = "High"
+
+        elif confidence >= 65:
+            confidence_level = "Moderate"
+
+        else:
+            confidence_level = "Low"
 
         result = {
-
-            "verdict":
-                (
-                    "Likely fake"
-                    if is_fake
-                    else "Likely authentic"
-                ),
-
-            "confidence":
-                confidence,
-
-            "real_probability":
-                real_probability,
-
-            "fake_probability":
-                fake_probability,
-
-            "predicted_class":
-                (
-                    "fake"
-                    if is_fake
-                    else "real"
-                ),
-
-            "frames":
-                frames_processed,
-
-            "faces":
-                faces_total
+            "verdict": verdict,
+            "predicted_class": predicted_class,
+            "confidence": round(confidence, 2),
+            "real_probability": round(real_probability, 2),
+            "fake_probability": round(fake_probability, 2),
+            "confidence_level": confidence_level
         }
 
-        user = get_user(
-            token_from_header(
-                authorization
+        user = get_current_user(authorization)
+
+        if user:
+
+            save_scan(
+                user_id=user["id"],
+                filename=filename,
+                media_type="video",
+                verdict=verdict,
+                confidence=confidence,
+                real_probability=real_probability,
+                fake_probability=fake_probability,
+                faces=face_count,
+                frames=processed_frames
             )
-        )
-
-        save_scan(
-
-            user["id"]
-            if user
-            else None,
-
-            filename,
-
-            "video",
-
-            result
-        )
 
         return {
-
-            "status":
-                "Complete",
-
+            "status": "Complete",
+            "filename": filename,
+            "media_type": "video",
+            "engine": "ONNX Runtime - MobileNetV3",
             **result,
-
-            "media_type":
-                "video",
-
-            "engine":
-                "MobileNetV3-Small",
-
-            "total_frames":
-                total_frames,
-
-            "fps":
-                fps,
-
-            "duration":
-                duration,
-
-            "confidence_level":
-                "MODEL SCORE - NOT CALIBRATED",
-
-            "note":
-                (
-                    "Prediction generated from "
-                    "sampled video frames using "
-                    "the trained MobileNetV3 model. "
-                    "The score is not a calibrated "
-                    "probability or a guarantee "
-                    "of authenticity."
-                )
+            "faces": face_count,
+            "frames": processed_frames,
+            "total_frames": total_frames,
+            "note": "Video prediction is based on sampled frames."
         }
-
-    except HTTPException:
-
-        raise
-
-    except Exception as error:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(error)
-        )
 
     finally:
 
-        if temp_path:
+        if capture is not None:
+            capture.release()
 
-            try:
-
-                os.unlink(
-                    temp_path
-                )
-
-            except OSError:
-
-                pass
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 # =========================================================
-# FRONTEND
+# 18. HEALTH CHECK
 # =========================================================
 
-app.mount(
-    "/",
-    StaticFiles(
-        directory=str(
-            FRONTEND_DIR
+@app.get("/api/health")
+async def health():
+
+    return {
+        "status": "success",
+        "message": "DeepFAke AI backend is running",
+        "model_ready": MODEL is not None,
+        "mode": "onnx_mobilenetv3",
+        "provider": (
+            MODEL.get_providers()
+            if MODEL is not None
+            else []
         ),
-        html=True
-    ),
-    name="frontend"
-)
+        "model_accuracy": (
+            MODEL_CONFIG.get("best_val_accuracy")
+            if MODEL_CONFIG
+            else None
+        )
+    }
+
+
+# =========================================================
+# 19. LOAD MODEL
+# =========================================================
+
+load_model()
+
+
+# =========================================================
+# 20. FRONTEND
+# =========================================================
+
+if FRONTEND_DIR.exists():
+
+    app.mount(
+        "/",
+        StaticFiles(
+            directory=str(FRONTEND_DIR),
+            html=True
+        ),
+        name="frontend"
+    )
+
+else:
+
+    print(
+        "WARNING: Frontend directory not found:",
+        FRONTEND_DIR
+    )
